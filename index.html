@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>H10 Voice</title>
+<style>
+body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center;padding:env(safe-area-inset-top) 16px 24px}
+h1{font-size:20px;margin:16px 0}
+.big{display:flex;justify-content:space-around;margin:20px 0}
+.v{font-size:72px;font-weight:700;line-height:1}.l{font-size:16px;color:#aaa}
+button{font-size:22px;padding:16px 28px;margin:8px;border:0;border-radius:12px;color:#fff}
+#start{background:#1a8f3a}#stop{background:#a33}
+select{font-size:18px;padding:8px}#status{color:#9cf;margin:12px;min-height:1.2em}
+</style></head><body>
+<h1>Polar H10 – spoken HR &amp; HRV</h1>
+<div class="big"><div><div class="v" id="hr">--</div><div class="l">HR bpm</div></div>
+<div><div class="v" id="hrv">--</div><div class="l">HRV (RMSSD ms)</div></div></div>
+<div>Live: <span id="live">--</span> bpm</div>
+<div style="margin:12px">Speak every <select id="iv"><option>15</option><option selected>30</option><option>60</option><option>120</option></select> s</div>
+<button id="start">Start</button><button id="stop">Stop</button>
+<div id="status">Tap Start, then pick your H10.</div>
+<script>
+// ---- pure logic (unit-testable) ----
+function parseHR(dv){
+  const f=dv.getUint8(0);let i=1,hr;
+  if(f&1){hr=dv.getUint16(i,true);i+=2}else{hr=dv.getUint8(i);i+=1}
+  if(f&8)i+=2; // energy expended
+  const rr=[];
+  if(f&16){while(i+1<dv.byteLength){rr.push(dv.getUint16(i,true)*1000/1024);i+=2}}
+  return {hr,rr};
+}
+function cleanRR(rr,prev){
+  const out=[];let p=prev;
+  for(const r of rr){
+    if(r<300||r>2000){continue}
+    if(p!=null&&Math.abs(r-p)/p>0.2){p=r;continue}
+    out.push(r);p=r;
+  }
+  return out;
+}
+function rmssd(rr){
+  if(rr.length<2)return null;let s=0;
+  for(let i=1;i<rr.length;i++){const d=rr[i]-rr[i-1];s+=d*d}
+  return Math.sqrt(s/(rr.length-1));
+}
+if(typeof module!=='undefined'){module.exports={parseHR,cleanRR,rmssd}}
+// ---- app ----
+if(typeof document!=='undefined'){
+const $=id=>document.getElementById(id);
+let dev=null,running=false,timer=null,wake=null,lastRR=null;
+let win=[]; // {t,hr,rr:[]}
+const status=m=>$('status').textContent=m;
+function speak(t){try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.rate=1;speechSynthesis.speak(u)}catch(e){}}
+function onData(e){
+  const {hr,rr}=parseHR(e.target.value);
+  const good=cleanRR(rr,lastRR); if(rr.length)lastRR=rr[rr.length-1];
+  win.push({t:Date.now(),hr,rr:good});$('live').textContent=hr;
+}
+function report(){
+  const ms=+$('iv').value*1000,now=Date.now();
+  win=win.filter(x=>now-x.t<=ms);
+  if(!win.length){status('No data in window');return}
+  const hr=Math.round(win.reduce((a,x)=>a+x.hr,0)/win.length);
+  const v=rmssd(win.flatMap(x=>x.rr));
+  $('hr').textContent=hr;$('hrv').textContent=v==null?'--':Math.round(v);
+  speak('Heart rate '+hr+'. '+(v==null?'HRV unavailable.':'HRV '+Math.round(v)+'.'));
+}
+function schedule(){clearInterval(timer);if(running)timer=setInterval(report,+$('iv').value*1000)}
+$('iv').onchange=schedule;
+async function connect(){
+  for(let n=0;running;n++){
+    try{status('Connecting…');
+      const s=await dev.gatt.connect();
+      const c=await (await s.getPrimaryService(0x180d)).getCharacteristic(0x2a37);
+      c.addEventListener('characteristicvaluechanged',onData);
+      await c.startNotifications();status('Connected to '+(dev.name||'H10'));return;
+    }catch(e){status('Retry '+(n+1)+': '+e.message);await new Promise(r=>setTimeout(r,Math.min(2000*(n+1),10000)))}
+  }
+}
+async function lock(){try{if('wakeLock' in navigator)wake=await navigator.wakeLock.request('screen')}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(running&&document.visibilityState==='visible')lock()});
+$('start').onclick=async()=>{
+  speak('Starting'); // unlock speech on user gesture
+  if(!navigator.bluetooth){status('Web Bluetooth not available. On iPhone use the Bluefy browser.');return}
+  try{
+    if(!dev){dev=await navigator.bluetooth.requestDevice({filters:[{services:[0x180d]}]});
+      dev.addEventListener('gattserverdisconnected',()=>{if(running){status('Disconnected, reconnecting…');connect()}})}
+    running=true;win=[];lastRR=null;lock();await connect();schedule();
+  }catch(e){status('Error: '+e.message)}
+};
+$('stop').onclick=()=>{running=false;clearInterval(timer);try{dev&&dev.gatt.connected&&dev.gatt.disconnect()}catch(e){}
+  try{wake&&wake.release()}catch(e){}speechSynthesis.cancel();status('Stopped')};
+}
+</script></body></html>
